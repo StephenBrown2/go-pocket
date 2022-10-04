@@ -48,7 +48,7 @@ func main() {
 	usage := `A Pocket <getpocket.com> client.
 
 Usage:
-  pocket list [--format=<template>] [--domain=<domain>] [--tag=<tag>] [--search=<query>] [--cull]
+  pocket list [--format=<template>] [--domain=<domain>] [--tag=<tag>] [--search=<query>] [--sort=<sort>] [--cull]
   pocket archive <item-id>
   pocket delete <item-id>
   pocket add <url> [--title=<title>] [--tags=<tags>]
@@ -58,6 +58,7 @@ Options for list:
   -d, --domain <domain>   Filter items by its domain when listing.
   -s, --search <query>    Search query when listing.
   -t, --tag <tag>         Filter items by a tag when listing.
+  -o, --sort <sort>       Sort items by "newest", "oldest", "title", or "site"
 
 Options for add:
   --title <title>         A manually specified title for the article
@@ -138,6 +139,10 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 
 	if tag, ok := arguments["--tag"].(string); ok {
 		options.Tag = tag
+	}
+
+	if sort, ok := arguments["--sort"].(string); ok {
+		options.Sort = api.Sort(sort)
 	}
 
 	res, err := client.Retrieve(options)

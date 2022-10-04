@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"text/template"
 
 	"github.com/docopt/docopt-go"
@@ -24,7 +26,7 @@ import (
 var version = "0.1"
 
 var defaultItemTemplate = template.Must(template.New("item").Parse(
-	`[{{.ItemID | printf "%9d"}}] {{.Title}} <{{.URL}}>`,
+	"[{{.ItemID | printf \"%9d\"}}] ({{.TimeAdded.Format \"Mon, 02 Jan 2006 15:04:05 MST\"}}) {{.Title}}\n<{{.URL}}>",
 ))
 
 var configDir string
@@ -46,8 +48,9 @@ func main() {
 	usage := `A Pocket <getpocket.com> client.
 
 Usage:
-  pocket list [--format=<template>] [--domain=<domain>] [--tag=<tag>] [--search=<query>]
+  pocket list [--format=<template>] [--domain=<domain>] [--tag=<tag>] [--search=<query>] [--cull]
   pocket archive <item-id>
+  pocket delete <item-id>
   pocket add <url> [--title=<title>] [--tags=<tags>]
 
 Options for list:
@@ -79,6 +82,8 @@ Options for add:
 		commandList(arguments, client)
 	} else if do, ok := arguments["archive"].(bool); ok && do {
 		commandArchive(arguments, client)
+	} else if do, ok := arguments["delete"].(bool); ok && do {
+		commandDelete(arguments, client)
 	} else if do, ok := arguments["add"].(bool); ok && do {
 		commandAdd(arguments, client)
 	} else {
@@ -91,6 +96,34 @@ type bySortID []api.Item
 func (s bySortID) Len() int           { return len(s) }
 func (s bySortID) Less(i, j int) bool { return s[i].SortId < s[j].SortId }
 func (s bySortID) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+// confirm asks the user for confirmation. A user must type in "yes" or "no" and
+// then press enter. It has fuzzy matching, so "y", "Y", "yes", "YES", and "Yes" all count as
+// confirmations. If the input is not recognized, it will ask again. The function does not return
+// until it gets a valid response from the user.
+func confirm(s string) bool {
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Printf("%s [y/n]: ", s)
+
+		response, err := reader.ReadString('\n')
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		response = strings.ToLower(strings.TrimSpace(response))
+
+		switch response {
+		case "y", "yes":
+			return true
+		case "n", "no":
+			return false
+		case "q", "quit":
+			log.Fatal("Quitting. Bye!")
+		}
+	}
+}
 
 func commandList(arguments map[string]interface{}, client *api.Client) {
 	options := &api.RetrieveOption{}
@@ -125,11 +158,46 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 	}
 
 	sort.Sort(bySortID(items))
-
+	seenURLs := map[string]struct{}{}
 	for _, item := range items {
 		err := itemTemplate.Execute(os.Stdout, item)
 		if err != nil {
 			panic(err)
+		}
+		if cull, ok := arguments["--cull"].(bool); ok && cull {
+			if _, found := seenURLs[item.URL()]; found {
+				fmt.Printf("Item already seen. Deleting...")
+				action := api.NewDeleteAction(item.ItemID)
+				res, err := client.Modify(action)
+				if err != nil {
+					fmt.Printf("%#v, %v\n", res, err)
+				}
+			} else {
+				seenURLs[item.URL()] = struct{}{}
+			}
+			chk, err := http.Get(item.URL())
+			if err != nil {
+				log.Fatal(err)
+			}
+			if chk.StatusCode <= http.StatusPermanentRedirect {
+				fmt.Printf(" %s\n", chk.Status)
+				cmd := exec.Command("firefox", "--new-tab", item.URL())
+				if _, err := cmd.Output(); err != nil {
+					if exitErr, ok := err.(*exec.ExitError); ok {
+						log.Fatalf("Failed to run firefox: %s, %s", err, exitErr.Stderr)
+					}
+					log.Fatalf("Failed to run firefox: %s", err)
+				}
+			} else {
+				fmt.Printf("\nStatus was %s\n", chk.Status)
+			}
+			if confirm("Delete?") {
+				action := api.NewDeleteAction(item.ItemID)
+				res, err := client.Modify(action)
+				if err != nil {
+					fmt.Printf("%#v, %v\n", res, err)
+				}
+			}
 		}
 		fmt.Println("")
 	}
@@ -143,6 +211,21 @@ func commandArchive(arguments map[string]interface{}, client *api.Client) {
 		}
 
 		action := api.NewArchiveAction(itemID)
+		res, err := client.Modify(action)
+		fmt.Println(res, err)
+	} else {
+		panic("Wrong arguments")
+	}
+}
+
+func commandDelete(arguments map[string]interface{}, client *api.Client) {
+	if itemIDString, ok := arguments["<item-id>"].(string); ok {
+		itemID, err := strconv.Atoi(itemIDString)
+		if err != nil {
+			panic(err)
+		}
+
+		action := api.NewDeleteAction(itemID)
 		res, err := client.Modify(action)
 		fmt.Println(res, err)
 	} else {

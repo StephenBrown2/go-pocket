@@ -118,7 +118,9 @@ type Item struct {
 	TimeFavorited Time `json:"time_favorited"`
 }
 
-type Time time.Time
+type Time struct {
+	time.Time
+}
 
 func (t *Time) UnmarshalJSON(b []byte) error {
 	i, err := strconv.ParseInt(string(bytes.Trim(b, `"`)), 10, 64)
@@ -126,9 +128,13 @@ func (t *Time) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	*t = Time(time.Unix(i, 0))
+	*t = Time{time.Unix(i, 0)}
 
 	return nil
+}
+
+func (t Time) Format(layout string) string {
+	return t.Time.Format(layout)
 }
 
 // URL returns ResolvedURL or GivenURL

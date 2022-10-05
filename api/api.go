@@ -43,7 +43,17 @@ func doJSON(req *http.Request, res interface{}) error {
 	}
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("got response %d; X-Error=[%s]", resp.StatusCode, resp.Header.Get("X-Error"))
+		return fmt.Errorf("got response %d; X-Error=%q; X-Error-Code=%q; X-Limit-User-Limit=%q; X-Limit-User-Remaining=%q; X-Limit-User-Reset=%q; X-Limit-Key-Limit=%q; X-Limit-Key-Remaining=%q; X-Limit-Key-Reset=%q",
+			resp.StatusCode,
+			resp.Header.Get("X-Error"),
+			resp.Header.Get("X-Error-Code"),
+			resp.Header.Get("X-Limit-User-Limit"),
+			resp.Header.Get("X-Limit-User-Remaining"),
+			resp.Header.Get("X-Limit-User-Reset"),
+			resp.Header.Get("X-Limit-Key-Limit"),
+			resp.Header.Get("X-Limit-Key-Remaining"),
+			resp.Header.Get("X-Limit-Key-Reset"),
+		)
 	}
 
 	defer resp.Body.Close()

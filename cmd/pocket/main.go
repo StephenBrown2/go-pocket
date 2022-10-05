@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -13,8 +14,8 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"text/template"
 
@@ -44,6 +45,48 @@ func init() {
 	}
 }
 
+func CleanURL(url string) string {
+	// HTTPS by default
+	url = strings.ReplaceAll(url, "http://", "https://")
+	// Remove some youtube params
+	url = strings.TrimSuffix(url, "&a")
+	url = strings.ReplaceAll(url, "feature=g-u", "")
+	url = strings.ReplaceAll(url, "feature=youtu.be", "")
+	url = strings.ReplaceAll(url, "feature=youtube_gdata", "")
+	// Deduplicate any double ampersands
+	amps := regexp.MustCompile("&+")
+	url = amps.ReplaceAllString(url, "&")
+	url = strings.TrimRight(url, "&")
+	// Drop trailing slash
+	url = strings.TrimRight(url, "/")
+
+	return url
+}
+
+type Config struct {
+	List    bool `docopt:"list"`
+	Archive bool `docopt:"archive"`
+	Add     bool `docopt:"add"`
+	Delete  bool `docopt:"delete"`
+
+	// Options for list
+	FormatTemplate string `docopt:"-f,--format"`
+	Domain         string `docopt:"-d,--domain"`
+	SearchQuery    string `docopt:"-s,--search"`
+	Tag            string `docopt:"-t,--tag"`
+	Sort           string `docopt:"-o,--sort"`
+	Cull           bool   `docopt:"--cull"`
+	DeleteAll      bool   `docopt:"--delete"`
+
+	// Parameter for archive and delete
+	ItemID int `docopt:"<item-id>"`
+
+	// Options for add
+	URL   string `docopt:"<url>"`
+	Title string `docopt:"--title"`
+	Tags  string `docopt:"--tags"`
+}
+
 func main() {
 	usage := `A Pocket <getpocket.com> client.
 
@@ -66,8 +109,13 @@ Options for add:
   --title <title>         A manually specified title for the article
   --tags <tags>           A comma-separated list of tags
 `
+	opts, err := docopt.ParseArgs(usage, nil, version)
+	if err != nil {
+		panic(err)
+	}
 
-	arguments, err := docopt.Parse(usage, nil, true, version, false)
+	var conf Config
+	err = opts.Bind(&conf)
 	if err != nil {
 		panic(err)
 	}
@@ -81,15 +129,16 @@ Options for add:
 
 	client := api.NewClient(consumerKey, accessToken.AccessToken)
 
-	if do, ok := arguments["list"].(bool); ok && do {
-		commandList(arguments, client)
-	} else if do, ok := arguments["archive"].(bool); ok && do {
-		commandArchive(arguments, client)
-	} else if do, ok := arguments["delete"].(bool); ok && do {
-		commandDelete(arguments, client)
-	} else if do, ok := arguments["add"].(bool); ok && do {
-		commandAdd(arguments, client)
-	} else {
+	switch {
+	case conf.List:
+		commandList(conf, client)
+	case conf.Archive:
+		commandArchive(conf, client)
+	case conf.Delete:
+		commandDelete(conf, client)
+	case conf.Add:
+		commandAdd(conf, client)
+	default:
 		panic("Not implemented")
 	}
 }
@@ -112,7 +161,8 @@ func confirm(s string) bool {
 
 		response, err := reader.ReadString('\n')
 		if err != nil {
-			log.Fatal(err)
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 
 		response = strings.ToLower(strings.TrimSpace(response))
@@ -123,38 +173,28 @@ func confirm(s string) bool {
 		case "n", "no":
 			return false
 		case "q", "quit":
-			log.Fatal("Quitting. Bye!")
+			fmt.Fprintln(os.Stderr, "Quitting. Bye!")
+			os.Exit(1)
 		}
 	}
 }
 
-func commandList(arguments map[string]interface{}, client *api.Client) {
-	options := &api.RetrieveOption{}
-
-	if domain, ok := arguments["--domain"].(string); ok {
-		options.Domain = domain
+func commandList(conf Config, client *api.Client) {
+	options := api.RetrieveOption{
+		Domain: conf.Domain,
+		Search: conf.SearchQuery,
+		Tag:    conf.Tag,
+		Sort:   api.Sort(conf.Sort),
 	}
 
-	if search, ok := arguments["--search"].(string); ok {
-		options.Search = search
-	}
-
-	if tag, ok := arguments["--tag"].(string); ok {
-		options.Tag = tag
-	}
-
-	if sort, ok := arguments["--sort"].(string); ok {
-		options.Sort = api.Sort(sort)
-	}
-
-	res, err := client.Retrieve(options)
+	res, err := client.Retrieve(&options)
 	if err != nil {
 		panic(err)
 	}
 
 	var itemTemplate *template.Template
-	if format, ok := arguments["--format"].(string); ok {
-		itemTemplate = template.Must(template.New("item").Parse(format))
+	if conf.FormatTemplate != "" {
+		itemTemplate = template.Must(template.New("item").Parse(conf.FormatTemplate))
 	} else {
 		itemTemplate = defaultItemTemplate
 	}
@@ -163,7 +203,7 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 	for _, item := range res.List {
 		items = append(items, item)
 	}
-	if delete, ok := arguments["--delete"].(bool); ok && delete {
+	if conf.DeleteAll {
 		if confirm(fmt.Sprintf("Really delete %d items?", len(items))) {
 			deleteItems := []*api.Action{}
 			for _, item := range items {
@@ -178,45 +218,61 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 	}
 	sort.Sort(bySortID(items))
 	seenURLs := map[string]struct{}{}
-	for _, item := range items {
+	itemsLen := len(items)
+	for i, item := range items {
+		fmt.Printf("%d/%d ", i+1, itemsLen)
 		err := itemTemplate.Execute(os.Stdout, item)
 		if err != nil {
 			panic(err)
 		}
-		if cull, ok := arguments["--cull"].(bool); ok && cull {
-			url := strings.ReplaceAll(item.URL(), "feature=youtu.be", "")
-			url = strings.ReplaceAll(url, "feature=youtube_gdata", "")
-			url = strings.ReplaceAll(url, "http://", "https://")
-			url = strings.TrimRight(url, "&")
-			if _, found := seenURLs[url]; found {
-				fmt.Printf("Item already seen. Deleting...")
-				action := api.NewDeleteAction(item.ItemID)
-				res, err := client.Modify(action)
-				if err != nil {
-					fmt.Printf("%#v, %v\n", res, err)
-				}
-			} else {
-				seenURLs[url] = struct{}{}
-			}
-			chk, err := http.Get(item.URL())
+		url := CleanURL(item.URL())
+		if _, found := seenURLs[url]; found {
+			fmt.Println("\nItem already seen. Deleting...")
+			action := api.NewDeleteAction(item.ItemID)
+			res, err := client.Modify(action)
 			if err != nil {
-				fmt.Println(err)
-			} else {
-				if chk.StatusCode <= http.StatusPermanentRedirect {
-					fmt.Printf(" %s\n", chk.Status)
-					if confirm("Open?") {
-						url := strings.Replace(item.URL(), "http://", "https://", 1)
-						cmd := exec.Command("firefox", "--new-tab", url)
-						if _, err := cmd.Output(); err != nil {
-							if exitErr, ok := err.(*exec.ExitError); ok {
-								log.Fatalf("Failed to run firefox: %s, %s", err, exitErr.Stderr)
-							}
-							log.Fatalf("Failed to run firefox: %s", err)
-						}
-					}
-				} else {
-					fmt.Printf("\nStatus was %s\n", chk.Status)
+				fmt.Printf("%#v, %v\n", res, err)
+			}
+			fmt.Println("")
+			continue
+		} else {
+			seenURLs[url] = struct{}{}
+		}
+		if conf.Cull {
+			chk, err := http.Head(item.URL())
+			if err != nil {
+				fmt.Printf("\nGot an err when HEADing: %s, GETting instead...\n", err.Error())
+				chk, err = http.Get(item.URL())
+				if err != nil {
+					fmt.Printf("\n%s\n", err.Error())
 				}
+			}
+			if err != nil && !strings.HasSuffix(err.Error(), ": EOF") {
+				if body, err := io.ReadAll(chk.Body); err != nil &&
+					(strings.Contains(string(body), "isn't available anymore") ||
+						strings.Contains(string(body), "this page doesn")) {
+					chk.StatusCode = http.StatusNotFound
+					chk.Status = "Not Available"
+				}
+			}
+			if err == nil && chk.StatusCode <= http.StatusPermanentRedirect {
+				fmt.Printf(" %s\n", chk.Status)
+				fin := chk.Request.URL.String()
+				openPrompt := "Open?"
+				if fin != item.URL() {
+					openPrompt = fmt.Sprintf("Open %s?", fin)
+				}
+				if confirm(openPrompt) {
+					cmd := exec.Command("firefox", "--new-tab", fin)
+					if _, err := cmd.Output(); err != nil {
+						if exitErr, ok := err.(*exec.ExitError); ok {
+							log.Fatalf("Failed to run firefox: %s, %s", err, exitErr.Stderr)
+						}
+						log.Fatalf("Failed to run firefox: %s", err)
+					}
+				}
+			} else if (err != nil && !strings.HasSuffix(err.Error(), ": EOF")) || err == nil {
+				fmt.Printf("\nStatus was %s\n", chk.Status)
 			}
 			if confirm("Delete?") {
 				action := api.NewDeleteAction(item.ItemID)
@@ -230,55 +286,42 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 	}
 }
 
-func commandArchive(arguments map[string]interface{}, client *api.Client) {
-	if itemIDString, ok := arguments["<item-id>"].(string); ok {
-		itemID, err := strconv.Atoi(itemIDString)
-		if err != nil {
-			panic(err)
-		}
-
-		action := api.NewArchiveAction(itemID)
+func commandArchive(conf Config, client *api.Client) {
+	if conf.ItemID != 0 {
+		action := api.NewArchiveAction(conf.ItemID)
 		res, err := client.Modify(action)
 		fmt.Println(res, err)
 	} else {
-		panic("Wrong arguments")
+		panic("Wrong arguments, need <item-id>")
 	}
 }
 
-func commandDelete(arguments map[string]interface{}, client *api.Client) {
-	if itemIDString, ok := arguments["<item-id>"].(string); ok {
-		itemID, err := strconv.Atoi(itemIDString)
-		if err != nil {
-			panic(err)
-		}
-
-		action := api.NewDeleteAction(itemID)
+func commandDelete(conf Config, client *api.Client) {
+	if conf.ItemID != 0 {
+		action := api.NewDeleteAction(conf.ItemID)
 		res, err := client.Modify(action)
-		fmt.Println(res, err)
+		if err != nil {
+			fmt.Println(res, err)
+		} else {
+			fmt.Printf("Deleted item %d\n", conf.ItemID)
+		}
 	} else {
-		panic("Wrong arguments")
+		panic("Wrong arguments, need <item-id>")
 	}
 }
 
-func commandAdd(arguments map[string]interface{}, client *api.Client) {
-	options := &api.AddOption{}
-
-	url, ok := arguments["<url>"].(string)
-	if !ok {
-		panic("Wrong arguments")
+func commandAdd(conf Config, client *api.Client) {
+	if conf.URL == "" {
+		panic("Wrong arguments, need <url>")
 	}
 
-	options.URL = url
-
-	if title, ok := arguments["--title"].(string); ok {
-		options.Title = title
+	options := api.AddOption{
+		URL:   conf.URL,
+		Title: conf.Title,
+		Tags:  conf.Tags,
 	}
 
-	if tags, ok := arguments["--tags"].(string); ok {
-		options.Tags = tags
-	}
-
-	err := client.Add(options)
+	err := client.Add(&options)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -290,7 +333,7 @@ func getConsumerKey() string {
 	consumerKey, err := ioutil.ReadFile(consumerKeyPath)
 
 	if err != nil {
-		log.Printf("Can't get consumer key: %v", err)
+		log.Printf("Can't get consumer key: %v\n", err)
 		log.Print("Enter your consumer key (from here https://getpocket.com/developer/apps/): ")
 
 		consumerKey, _, err = bufio.NewReader(os.Stdin).ReadLine()

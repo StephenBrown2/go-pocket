@@ -48,7 +48,7 @@ func main() {
 	usage := `A Pocket <getpocket.com> client.
 
 Usage:
-  pocket list [--format=<template>] [--domain=<domain>] [--tag=<tag>] [--search=<query>] [--sort=<sort>] [--cull]
+  pocket list [--format=<template>] [--domain=<domain>] [--tag=<tag>] [--search=<query>] [--sort=<sort>] [--cull|--delete]
   pocket archive <item-id>
   pocket delete <item-id>
   pocket add <url> [--title=<title>] [--tags=<tags>]
@@ -59,6 +59,8 @@ Options for list:
   -s, --search <query>    Search query when listing.
   -t, --tag <tag>         Filter items by a tag when listing.
   -o, --sort <sort>       Sort items by "newest", "oldest", "title", or "site"
+  --cull                  Open items one by one in a browser and prompt to delete each one
+  --delete                Delete all items retrieved
 
 Options for add:
   --title <title>         A manually specified title for the article
@@ -161,7 +163,19 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 	for _, item := range res.List {
 		items = append(items, item)
 	}
-
+	if delete, ok := arguments["--delete"].(bool); ok && delete {
+		if confirm(fmt.Sprintf("Really delete %d items?", len(items))) {
+			deleteItems := []*api.Action{}
+			for _, item := range items {
+				deleteItems = append(deleteItems, api.NewDeleteAction(item.ItemID))
+			}
+			res, err := client.Modify(deleteItems...)
+			if err != nil {
+				fmt.Printf("%#v, %v\n", res, err)
+			}
+		}
+		return
+	}
 	sort.Sort(bySortID(items))
 	seenURLs := map[string]struct{}{}
 	for _, item := range items {
@@ -170,7 +184,11 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 			panic(err)
 		}
 		if cull, ok := arguments["--cull"].(bool); ok && cull {
-			if _, found := seenURLs[item.URL()]; found {
+			url := strings.ReplaceAll(item.URL(), "feature=youtu.be", "")
+			url = strings.ReplaceAll(url, "feature=youtube_gdata", "")
+			url = strings.ReplaceAll(url, "http://", "https://")
+			url = strings.TrimRight(url, "&")
+			if _, found := seenURLs[url]; found {
 				fmt.Printf("Item already seen. Deleting...")
 				action := api.NewDeleteAction(item.ItemID)
 				res, err := client.Modify(action)
@@ -178,23 +196,27 @@ func commandList(arguments map[string]interface{}, client *api.Client) {
 					fmt.Printf("%#v, %v\n", res, err)
 				}
 			} else {
-				seenURLs[item.URL()] = struct{}{}
+				seenURLs[url] = struct{}{}
 			}
 			chk, err := http.Get(item.URL())
 			if err != nil {
-				log.Fatal(err)
-			}
-			if chk.StatusCode <= http.StatusPermanentRedirect {
-				fmt.Printf(" %s\n", chk.Status)
-				cmd := exec.Command("firefox", "--new-tab", item.URL())
-				if _, err := cmd.Output(); err != nil {
-					if exitErr, ok := err.(*exec.ExitError); ok {
-						log.Fatalf("Failed to run firefox: %s, %s", err, exitErr.Stderr)
-					}
-					log.Fatalf("Failed to run firefox: %s", err)
-				}
+				fmt.Println(err)
 			} else {
-				fmt.Printf("\nStatus was %s\n", chk.Status)
+				if chk.StatusCode <= http.StatusPermanentRedirect {
+					fmt.Printf(" %s\n", chk.Status)
+					if confirm("Open?") {
+						url := strings.Replace(item.URL(), "http://", "https://", 1)
+						cmd := exec.Command("firefox", "--new-tab", url)
+						if _, err := cmd.Output(); err != nil {
+							if exitErr, ok := err.(*exec.ExitError); ok {
+								log.Fatalf("Failed to run firefox: %s, %s", err, exitErr.Stderr)
+							}
+							log.Fatalf("Failed to run firefox: %s", err)
+						}
+					}
+				} else {
+					fmt.Printf("\nStatus was %s\n", chk.Status)
+				}
 			}
 			if confirm("Delete?") {
 				action := api.NewDeleteAction(item.ItemID)
